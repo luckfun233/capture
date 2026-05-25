@@ -1,9 +1,9 @@
-name: Build Windows EXE
+name: Build Windows EXE (Single File)
 
 on:
   workflow_dispatch:          # 允许手动触发
   push:
-    branches: [ "main" ]      # 推送到 main 分支时自动构建（可按需修改）
+    branches: [ "main" ]      # 推送到 main 分支时自动构建
 
 jobs:
   build:
@@ -16,35 +16,24 @@ jobs:
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.10"   # 可根据兼容性调整
+          python-version: "3.10"
 
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install opencv-python pillow pyinstaller
 
-      - name: Build with PyInstaller
+      - name: Build single EXE with PyInstaller
         run: |
-          # 假设你的主脚本名为 capture.pyw，请按实际名称修改
-          pyinstaller --onedir --noconsole `
+          pyinstaller --onefile --noconsole `
             --hidden-import opencv-python `
             --hidden-import PIL._imaging `
             --name capture `
             capture.pyw
 
-      - name: Copy auxiliary executable (if present)
-        # 如果仓库根目录有 swhelper1.exe，就复制到打包输出目录
-        run: |
-          if (Test-Path swhelper1.exe) {
-            Copy-Item swhelper1.exe dist\capture\ -Verbose
-            echo "swhelper1.exe copied to dist\capture\"
-          } else {
-            echo "swhelper1.exe not found, skipping."
-          }
-
-      - name: Upload artifact
+      - name: Upload artifact (single EXE)
         uses: actions/upload-artifact@v4
         with:
           name: capture-windows
-          path: dist/capture\     # 上传整个文件夹
-          retention-days: 7       # 保留7天，可按需修改
+          path: dist/capture.exe
+          retention-days: 7
