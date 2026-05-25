@@ -25,26 +25,30 @@ VALID_END = datetime.date(2026, 5, 27)
 # 默认配置值（会被 config.txt 覆盖）
 DEFAULT_CONFIG = {
     "camera_index": "0",
-    "warmup_frames": "30",          # 丢弃帧数（等待对焦稳定）
-    "quality_samples": "5",         # 采集多帧择优保存
-    "retry_delay_seconds": "300",   # 失败重试等待（秒）
+    "warmup_frames": "30",
+    "quality_samples": "5",
+    "retry_delay_seconds": "300",
     "max_retries": "3",
     "interval_minutes": "30",
 }
 
-# 运行时配置变量
+# 全局配置字典，只在主入口初始化一次
 config = {}
 
 # -------------------- 配置管理 --------------------
 def load_or_create_config():
-    """读取配置文件，如果不存在则用默认值创建。返回配置字典。"""
+    """读取配置文件，如果不存在则用默认值创建。正确更新全局 config。"""
     global config
 
     # 确保基础目录存在
     BASE_DIR.mkdir(parents=True, exist_ok=True)
 
+    # 先加载默认值
+    config.clear()
+    config.update(DEFAULT_CONFIG)
+
     if CONFIG_FILE.exists():
-        # 读取现有配置
+        # 读取用户配置，覆盖默认值
         with open(CONFIG_FILE, "r", encoding="utf-8") as f:
             for line in f:
                 line = line.strip()
@@ -56,13 +60,9 @@ def load_or_create_config():
                     value = value.strip()
                     if key in DEFAULT_CONFIG:
                         config[key] = value
-        # 补全缺失的配置项
-        for k, v in DEFAULT_CONFIG.items():
-            if k not in config:
-                config[k] = v
+        logging.info("已加载配置文件")
     else:
         # 创建默认配置文件
-        config = DEFAULT_CONFIG.copy()
         with open(CONFIG_FILE, "w", encoding="utf-8") as f:
             f.write("# 摄像头与截图自动保存配置\n")
             f.write("# 摄像头索引：0 通常为内置摄像头，1 为外接\n")
@@ -79,13 +79,13 @@ def load_or_create_config():
             f.write(f"interval_minutes={config['interval_minutes']}\n")
         logging.info("已创建默认配置文件 config.txt")
 
-    # 确保所有值都是有效的整数
-    for k in config:
+    # 验证数值有效性
+    for k in list(config.keys()):
         if k in DEFAULT_CONFIG:
             try:
                 int(config[k])
             except ValueError:
-                logging.error(f"配置项 {k} 值无效 ({config[k]})，使用默认值 {DEFAULT_CONFIG[k]}")
+                logging.warning(f"配置项 {k} 值无效 ({config[k]})，使用默认值 {DEFAULT_CONFIG[k]}")
                 config[k] = DEFAULT_CONFIG[k]
 
     return config
@@ -93,6 +93,25 @@ def load_or_create_config():
 def get_config_int(key):
     """安全获取整数配置值"""
     return int(config.get(key, DEFAULT_CONFIG[key]))
+
+# -------------------- 摄像头诊断 --------------------
+def list_available_cameras():
+    """扫描 0~9 索引，返回可用摄像头列表，并在日志中记录。"""
+    available = []
+    logging.info("正在扫描可用摄像头...")
+    for idx in range(10):
+        cap = cv2.VideoCapture(idx, cv2.CAP_ANY)
+        if cap.isOpened():
+            available.append(idx)
+            # 尝试获取摄像头名称（可能为空）
+            backend_name = "Unknown"
+            logging.info(f"  发现摄像头索引 {idx} 可用")
+            cap.release()
+        else:
+            cap.release()
+    if not available:
+        logging.warning("未检测到任何可用摄像头！")
+    return available
 
 # -------------------- 工具函数 --------------------
 def hide_console():
@@ -153,15 +172,18 @@ def capture_camera(save_path: Path) -> bool:
 
     cap = None
     try:
-        cap = cv2.VideoCapture(camera_index, cv2.CAP_DSHOW)
+        # 使用自动后端选择，避免 DSHOW 的潜在不稳定性
+        cap = cv2.VideoCapture(camera_index, cv2.CAP_ANY)
         if not cap.isOpened():
             logging.error(f"无法打开摄像头 (索引 {camera_index})")
             return False
 
+        # 尝试设置高分辨率
         cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1920)
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 1080)
         cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
 
+        # 丢弃预热帧
         for _ in range(warmup):
             ret, _ = cap.read()
             if not ret:
@@ -169,6 +191,7 @@ def capture_camera(save_path: Path) -> bool:
                 break
             time.sleep(0.05)
 
+        # 采集多帧并选最清晰
         best_frame = None
         best_sharpness = -1.0
         for i in range(samples):
@@ -218,13 +241,24 @@ def capture_screen(save_path: Path) -> bool:
         return False
 
 def execute_task_with_retry():
-    """执行一次拍摄任务：摄像头可重试，截屏仅尝试一次。"""
+    """
+    执行一次拍摄任务：先截屏，后拍摄摄像头（中间加延时），
+    摄像头失败可重试，截屏仅尝试一次。
+    """
     max_retries = get_config_int("max_retries")
     retry_delay = get_config_int("retry_delay_seconds")
     timestamp = get_timestamp()
     cam_dir = BASE_DIR / CAM_SUBDIR
     scr_dir = BASE_DIR / SCR_SUBDIR
 
+    # 1. 先进行屏幕截图（PIL），不与 OpenCV 并发
+    scr_path = scr_dir / f"{timestamp}_scr.png"
+    capture_screen(scr_path)
+
+    # 2. 稍作延时，避免资源竞争
+    time.sleep(1.0)
+
+    # 3. 再进行摄像头捕获（可重试）
     success_cam = False
     for attempt in range(1, max_retries + 1):
         cam_path = cam_dir / f"{timestamp}_cam.png"
@@ -239,9 +273,6 @@ def execute_task_with_retry():
                 timestamp = get_timestamp()
     if not success_cam:
         logging.error("摄像头拍摄最终失败，放弃本次摄像头任务")
-
-    scr_path = scr_dir / f"{timestamp}_scr.png"
-    capture_screen(scr_path)
 
 # -------------------- 正常模式（后台定时） --------------------
 def normal_mode():
@@ -300,9 +331,10 @@ if __name__ == "__main__":
     hide_console()
     BASE_DIR.mkdir(parents=True, exist_ok=True)
 
+    # 加载或创建配置
     config = load_or_create_config()
 
-    # 设置根目录隐藏
+    # 设置根目录及子目录隐藏
     if os.name == 'nt':
         try:
             ctypes.windll.kernel32.SetFileAttributesW(str(BASE_DIR), 0x02)
@@ -318,6 +350,16 @@ if __name__ == "__main__":
             pass
 
     setup_logging(BASE_DIR / LOG_FILE)
+
+    # 摄像头诊断：列出所有可用设备，并检查配置索引是否有效
+    available_cams = list_available_cameras()
+    configured_cam = get_config_int("camera_index")
+    if configured_cam not in available_cams:
+        logging.warning(f"配置的摄像头索引 {configured_cam} 不可用！请修改 config.txt 中的 camera_index")
+        if available_cams:
+            logging.info(f"可用摄像头索引: {available_cams}")
+        else:
+            logging.warning("没有可用的摄像头，摄像头功能将无法工作。")
 
     if "test" in sys.argv:
         logging.info("以测试模式启动")
