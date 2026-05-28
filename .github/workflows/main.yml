@@ -1,9 +1,9 @@
 name: Build Windows EXE (Single File)
 
 on:
-  workflow_dispatch:          # 允许手动触发
+  workflow_dispatch:
   push:
-    branches: [ "main" ]      # 推送到 main 分支时自动构建
+    branches: [ "main" ]
 
 jobs:
   build:
@@ -21,13 +21,16 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install opencv-python pillow pyinstaller
+          pip install opencv-python pillow pyinstaller pygrabber comtypes
 
       - name: Build single EXE with PyInstaller
         run: |
-          pyinstaller --onefile --noconsole `
-            --hidden-import opencv-python `
+          pyinstaller --onefile --noconsole --clean --noconfirm `
+            --hidden-import cv2 `
             --hidden-import PIL._imaging `
+            --collect-submodules cv2 `
+            --collect-submodules comtypes `
+            --collect-submodules pygrabber `
             --name capture `
             capture.pyw
 
