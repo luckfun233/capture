@@ -1,53 +1,74 @@
-name: Build Stealth Camera EXE
+name: Build Camera App EXE
 
-# 触发机制：当你 push 代码到 main 分支时触发，或者手动触发
 on:
   push:
     branches: [ main ]
   workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  PYTHON_VERSION: '3.10'
+  APP_NAME: CameraCapture
 
 jobs:
   build:
     runs-on: windows-latest
 
     steps:
-    # 1. 检出代码
-    - name: 📥 Checkout code
-      uses: actions/checkout@v4
+      - name: 📥 Checkout code
+        uses: actions/checkout@v4
 
-    # 2. 设置 Python 环境
-    - name: 🐍 Set up Python
-      uses: actions/setup-python@v5
-      with:
-        python-version: '3.10' # 使用 Python 3.10，与你本地环境保持一致
+      - name: 🐍 Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
 
-    # 3. 安装依赖
-    - name: 📦 Install dependencies
-      run: |
-        python -m pip install --upgrade pip
-        pip install -r requirements.txt
-        # 安装 pyinstaller 用于打包
-        pip install pyinstaller==6.11.1
+      - name: 📦 Install dependencies
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
 
-# 4. 执行打包命令
-    # 注意：这里故意不添加 --icon 参数，让 Windows 使用默认的通用程序图标（看起来像没有图标）
-    # --clean 非常重要：用于清除之前的构建缓存，防止残留旧的图标资源
-    - name: 📦 Build EXE with PyInstaller (No Custom Icon)
-      run: |
-        pyinstaller ^
-          --onefile ^
-          --windowed ^
-          --name "svchost" ^
-          --clean ^
-          capture.pyw
+          if (Test-Path requirements.txt) {
+            python -m pip install -r requirements.txt
+          }
 
-    # 5. 上传构建产物
-    - name: 📤 Upload EXE Artifact
-      uses: actions/upload-artifact@v4
-      with:
-        name: stealth-camera-exe
-        path: dist/SystemUpdate.exe # 对应上面 --name 设置的文件名
+          python -m pip install pyinstaller==6.11.1
 
-    # 6. (可选) 如果你想在日志中看到打包过程的大小信息
-    - name: 📊 Show build info
-      run: dir dist\
+      - name: ✅ Check source file
+        shell: pwsh
+        run: |
+          if (-not (Test-Path "capture.pyw")) {
+            throw "capture.pyw not found in repository root."
+          }
+
+      - name: 📦 Build EXE with PyInstaller
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $pyiArgs = @(
+            "--onefile",
+            "--windowed",
+            "--name", $env:APP_NAME,
+            "--clean",
+            "--noconfirm",
+            "capture.pyw"
+          )
+
+          python -m PyInstaller @pyiArgs
+
+      - name: 📊 Show build info
+        shell: pwsh
+        run: |
+          Get-ChildItem -Recurse dist
+          Get-Item "dist/$env:APP_NAME.exe" | Select-Object FullName, Length, LastWriteTime
+
+      - name: 📤 Upload EXE Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: camera-app-exe
+          path: dist/${{ env.APP_NAME }}.exe
+          if-no-files-found: error
